@@ -90,6 +90,22 @@ Other: ASE, QCEngine API
 - Energies: Hartrees (atomic units)
 - Gradients: Hartrees/Bohr
 
+## Internal Coordinate Transformations
+
+Key functions in `internal.py` for coordinate transformations:
+
+- `wilsonB(xyz)` - Returns B matrix where B[i,a] = ∂q_i/∂x_a (shape: nIC × 3N)
+- `second_derivatives(xyz)` - Returns B' matrix where B'[i,a,b] = ∂²q_i/∂x_a∂x_b (shape: nIC × nAtom × 3 × nAtom × 3)
+- `GMatrix(xyz)` - Returns G = B @ B.T (metric tensor, shape: nIC × nIC)
+- `GInverse(xyz)` - Returns generalized inverse G⁻¹ via SVD
+- `calcGrad(xyz, gradx)` - Transforms Cartesian gradient to IC: g_q = G⁻¹ @ B @ g_x
+- `calcHess(xyz, gradx, hessx)` - Transforms Cartesian Hessian to IC: H_q = G⁻¹ B (H_x - B'ᵀg_q) Bᵀ G⁻¹
+- `calcHessCart(xyz, gradq, hessq)` - Inverse transformation: H_x = Bᵀ H_q B + B'ᵀg_q
+
+The `--fdcheck` flag runs finite difference verification of these transformations.
+
+**Note**: Negative eigenvalues in IC Hessian with positive Cartesian Hessian is not necessarily a bug—it can occur due to the B'ᵀg_q term when gradients are large or due to metric tensor effects in the G⁻¹ B (...) Bᵀ G⁻¹ transformation.
+
 ## Versioning
 
 Uses versioneer for automatic versioning from git tags. Version format follows PEP 440.
