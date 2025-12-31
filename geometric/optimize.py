@@ -49,7 +49,7 @@ from numpy.linalg import multi_dot
 from .info import print_logo, print_citation
 from .internal import CartesianCoordinates, PrimitiveInternalCoordinates, DelocalizedInternalCoordinates
 from .ic_tools import check_internal_grad, check_internal_hess, write_displacements
-from .normal_modes import calc_cartesian_hessian, frequency_analysis
+from .normal_modes import calc_cartesian_hessian, calc_cartesian_hessian_from_energies, frequency_analysis
 from .step import brent_wiki, Froot, calc_drms_dmax, get_cartesian_norm, get_delta_prime, trust_step, force_positive_definite, update_hessian
 from .prepare import get_molecule_engine, parse_constraints
 from .params import OptParams, parse_optimizer_args
@@ -299,6 +299,41 @@ class Optimizer(object):
                            outfnm='%s.vdata_%s' % (prefix, suffix), note='Iteration %i Energy % .8f%s' % (self.Iteration, self.E, ' (Optimized Structure)' if afterOpt else ''),
                            wigner=((self.params.wigner, os.path.join(self.dirname, 'wigner')) if do_wigner else None), ignore=self.params.ignore_modes)
 
+    def compute_cartesian_hessian(self, coords, read_data=True):
+        """
+        Compute the Cartesian Hessian using either finite difference of gradients
+        or finite difference of energies (for methods without analytic gradients).
+
+        Parameters
+        ----------
+        coords : np.ndarray
+            1-dimensional array of shape (3*N_atoms) containing atomic coordinates in Bohr
+        read_data : bool
+            Read Hessian data from disk if valid
+
+        Returns
+        -------
+        Hx : np.ndarray
+            (Nx3)x(Nx3) array containing Cartesian Hessian.
+        """
+        if self.params.numerical_hessian:
+            # Use finite difference of energies (for methods without analytic gradients)
+            return calc_cartesian_hessian_from_energies(
+                coords, self.molecule, self.engine, self.dirname,
+                disp=self.params.numerical_hessian_displacement,
+                high_accuracy=self.params.numerical_hessian_high_accuracy,
+                read_data=read_data,
+                verbose=self.params.verbose
+            )
+        else:
+            # Use finite difference of gradients (standard method)
+            return calc_cartesian_hessian(
+                coords, self.molecule, self.engine, self.dirname,
+                read_data=read_data,
+                bigchem=self.params.bigchem,
+                verbose=self.params.verbose
+            )
+
     def calcEnergyForce(self):
         """
         Calculate the energy and Cartesian gradients of the current structure.
@@ -332,7 +367,7 @@ class Optimizer(object):
         if self.params.hessian == 'each' or self.recalcHess:
             # Hx is assumed to be the Cartesian Hessian at the current step.
             # Otherwise we use the variable name Hx0 to avoid almost certain confusion.
-            self.Hx = calc_cartesian_hessian(self.X, self.molecule, self.engine, self.dirname, read_data=True, bigchem=self.params.bigchem, verbose=self.params.verbose)
+            self.Hx = self.compute_cartesian_hessian(self.X, read_data=True)
             if self.params.frequency:
                 self.frequency_analysis(self.Hx, 'iter%03i' % self.Iteration, False)
             if self.recalcHess:
@@ -344,7 +379,7 @@ class Optimizer(object):
                 self.recalcHess = False
         elif self.Iteration == 0:
             if self.params.hessian in ['first', 'stop', 'first+last'] and not hasattr(self.params, 'hess_data'):
-                self.Hx0 = calc_cartesian_hessian(self.X, self.molecule, self.engine, self.dirname, read_data=True, bigchem=self.params.bigchem, verbose=self.params.verbose)
+                self.Hx0 = self.compute_cartesian_hessian(self.X, read_data=True)
                 logger.info(">> Initial Cartesian Hessian Eigenvalues\n")
                 self.SortedEigenvalues(self.Hx0)
                 if self.params.frequency:
@@ -1086,7 +1121,7 @@ class Optimizer(object):
             Hx = self.IC.calcHessCart(self.X, self.G, self.H)
             np.savetxt(self.params.write_cart_hess, Hx, fmt='% 14.10f')
         if self.params.hessian in ['last', 'first+last', 'each']:
-            Hx = calc_cartesian_hessian(self.X, self.molecule, self.engine, self.dirname, read_data=False, bigchem=self.params.bigchem, verbose=self.params.verbose)
+            Hx = self.compute_cartesian_hessian(self.X, read_data=False)
             if self.params.frequency:
                 self.frequency_analysis(Hx, 'last', True)
         return self.progress

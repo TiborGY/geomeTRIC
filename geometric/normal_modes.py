@@ -211,6 +211,243 @@ def calc_cartesian_hessian(coords, molecule, engine, dirname, read_data=True, bi
             shutil.rmtree(os.path.join(dirname, "hessian", "displace"))
     return Hx
 
+def calc_cartesian_hessian_from_energies(coords, molecule, engine, dirname, disp=1.0e-3,
+                                         high_accuracy=False, read_data=True, verbose=0):
+    """
+    Calculate the Cartesian Hessian using finite difference of energies.
+    This is useful for QM methods that do not have analytic gradients (e.g., some coupled cluster methods).
+
+    Parameters
+    ----------
+    coords : np.ndarray
+        1-dimensional array of shape (3*N_atoms) containing atomic coordinates in Bohr
+    molecule : Molecule
+        Molecule object
+    engine : Engine
+        Engine object that must have a `calc_energy_only` method for computing energy without gradient
+    dirname : str
+        Directory name for files to be written, i.e. <prefix>.tmp
+    disp : float
+        Displacement step size in Bohr for finite difference (default: 0.001)
+    high_accuracy : bool
+        If True, use 4th order (5-point diagonal, 8-point off-diagonal) formulas.
+        If False, use 2nd order (3-point diagonal, 4-point off-diagonal) formulas. (default: False)
+    read_data : bool
+        Read Hessian data from disk if valid
+    verbose : int
+        Print debugging info
+
+    Returns
+    -------
+    Hx : np.ndarray
+        (Nx3)x(Nx3) array containing Cartesian Hessian.
+        Files are also written to <prefix.tmp>/hessian.
+
+    Notes
+    -----
+    Standard (2nd order) formulas:
+    - Diagonal: H[i,i] = (E(+h) - 2*E0 + E(-h)) / h^2
+    - Off-diagonal: H[i,j] = (E(+h_i,+h_j) - E(+h_i,-h_j) - E(-h_i,+h_j) + E(-h_i,-h_j)) / (4*h^2)
+
+    High accuracy (4th order) formulas:
+    - Diagonal: H[i,i] = (-E(+2h) + 16*E(+h) - 30*E0 + 16*E(-h) - E(-2h)) / (12*h^2)
+    - Off-diagonal: H[i,j] = (-E(+2h_i,+2h_j) + 16*E(+h_i,+h_j)
+                              + E(+2h_i,-2h_j) - 16*E(+h_i,-h_j)
+                              + E(-2h_i,+2h_j) - 16*E(-h_i,+h_j)
+                              - E(-2h_i,-2h_j) + 16*E(-h_i,-h_j)) / (48*h^2)
+    """
+    nc = len(coords)
+    h = disp
+
+    # Check that engine has calc_energy_only method
+    if not hasattr(engine, 'calc_energy_only'):
+        raise RuntimeError("Engine does not support energy-only calculations (no calc_energy_only method). "
+                          "Numerical Hessian from energies is only supported for Molpro engine.")
+
+    # Attempt to read existing Hessian data if it exists
+    counter = 0
+    while read_data:
+        if counter > 0:
+            hesstxt = os.path.join(dirname, "hessian", "hessian_%i.txt" % counter)
+            hessxyz = os.path.join(dirname, "hessian", "coords_%i.xyz" % counter)
+        else:
+            hesstxt = os.path.join(dirname, "hessian", "hessian.txt")
+            hessxyz = os.path.join(dirname, "hessian", "coords.xyz")
+        if os.path.exists(hesstxt) and os.path.exists(hessxyz):
+            Hx = np.loadtxt(hesstxt)
+            if Hx.shape[0] == nc:
+                hess_mol = Molecule(hessxyz)
+                if np.allclose(coords.reshape(-1, 3)*bohr2ang, hess_mol.xyzs[0], atol=1e-6):
+                    logger.info("Using Hessian matrix read from file: %s\n" % hesstxt)
+                    return Hx
+        elif counter >= 1:
+            logger.info("Valid Hessian data not found, calculating from scratch.\n")
+            break
+        counter += 1
+
+    # Compute hessian from scratch
+    hesstxt = os.path.join(dirname, "hessian", "hessian.txt")
+    hessxyz = os.path.join(dirname, "hessian", "coords.xyz")
+    # First back up any existing Hessian data
+    if os.path.exists(hessxyz) and os.path.exists(hesstxt):
+        bak(hessxyz)
+        bak(hesstxt)
+
+    oldxyz = molecule.xyzs[0].copy()
+    molecule.xyzs[0] = coords.reshape(-1, 3)*bohr2ang
+    if not os.path.exists(os.path.join(dirname, "hessian")):
+        os.makedirs(os.path.join(dirname, "hessian"))
+
+    molecule[0].write(hessxyz)
+    if not read_data:
+        if os.path.exists(os.path.join(dirname, "hessian", "displace")):
+            shutil.rmtree(os.path.join(dirname, "hessian", "displace"))
+
+    Hx = np.zeros((nc, nc), dtype=float)
+
+    # Count total number of energy evaluations needed
+    if high_accuracy:
+        # Diagonal: 5 points each (center shared), Off-diagonal: 8 points each
+        # Number of off-diagonal pairs: nc*(nc-1)/2
+        n_offdiag = nc * (nc - 1) // 2
+        n_energies = 1 + 4*nc + 8*n_offdiag  # center + diagonal displacements + off-diagonal
+        logger.info("Calculating Cartesian Hessian using high-accuracy (4th order) finite difference on energies\n")
+    else:
+        # Diagonal: 3 points each (center shared), Off-diagonal: 4 points each
+        n_offdiag = nc * (nc - 1) // 2
+        n_energies = 1 + 2*nc + 4*n_offdiag
+        logger.info("Calculating Cartesian Hessian using standard (2nd order) finite difference on energies\n")
+    logger.info("Total energy evaluations required: %i\n" % n_energies)
+
+    # Dictionary to cache computed energies
+    energy_cache = {}
+    eval_count = [0]  # Use list to allow modification in nested function
+
+    def get_energy(displacements):
+        """
+        Get energy for given displacements from center.
+        displacements: list of tuples [(idx, delta), ...] where idx is coordinate index and delta is displacement
+        """
+        # Create cache key
+        key = tuple(sorted(displacements))
+        if key in energy_cache:
+            return energy_cache[key]
+
+        # Apply displacements
+        displaced_coords = coords.copy()
+        for idx, delta in displacements:
+            displaced_coords[idx] += delta
+
+        # Create directory name based on displacements
+        if len(displacements) == 0:
+            dirname_d = os.path.join(dirname, "hessian/displace/center")
+        elif len(displacements) == 1:
+            idx, delta = displacements[0]
+            sign = 'p' if delta > 0 else 'm'
+            mag = int(abs(delta) / h + 0.5)
+            dirname_d = os.path.join(dirname, "hessian/displace/%03i%s%i" % (idx+1, sign, mag))
+        else:
+            parts = []
+            for idx, delta in sorted(displacements):
+                sign = 'p' if delta > 0 else 'm'
+                mag = int(abs(delta) / h + 0.5)
+                parts.append("%03i%s%i" % (idx+1, sign, mag))
+            dirname_d = os.path.join(dirname, "hessian/displace/" + "_".join(parts))
+
+        energy = engine.calc_energy_only(displaced_coords, dirname_d)['energy']
+        energy_cache[key] = energy
+        eval_count[0] += 1
+
+        if eval_count[0] % 10 == 0:
+            logger.info("%i / %i energy calculations complete\n" % (eval_count[0], n_energies))
+
+        return energy
+
+    # Get center energy
+    E_center = get_energy([])
+
+    # Pre-compute finite difference coefficients
+    if high_accuracy:
+        inv_12h2 = 1.0 / (12 * h * h)
+        inv_48h2 = 1.0 / (48 * h * h)
+    else:
+        inv_h2 = 1.0 / (h * h)
+        inv_4h2 = 1.0 / (4 * h * h)
+
+    # Calculate diagonal elements
+    logger.info("Computing diagonal Hessian elements...\n")
+    for i in range(nc):
+        if verbose >= 1:
+            logger.info(" Computing diagonal element %i/%i\n" % (i+1, nc))
+
+        if high_accuracy:
+            # 5-point formula: H[i,i] = (-E(+2h) + 16*E(+h) - 30*E0 + 16*E(-h) - E(-2h)) / (12*h^2)
+            E_p2 = get_energy([(i, 2*h)])
+            E_p1 = get_energy([(i, h)])
+            E_m1 = get_energy([(i, -h)])
+            E_m2 = get_energy([(i, -2*h)])
+            Hx[i, i] = inv_12h2 * (-E_p2 + 16*E_p1 - 30*E_center + 16*E_m1 - E_m2)
+        else:
+            # 3-point formula: H[i,i] = (E(+h) - 2*E0 + E(-h)) / h^2
+            E_p = get_energy([(i, h)])
+            E_m = get_energy([(i, -h)])
+            Hx[i, i] = inv_h2 * (E_p - 2*E_center + E_m)
+
+    # Calculate off-diagonal elements (only upper triangle, then symmetrize)
+    logger.info("Computing off-diagonal Hessian elements...\n")
+    offdiag_count = 0
+    total_offdiag = nc * (nc - 1) // 2
+    for i in range(1, nc):
+        for j in range(i):
+            offdiag_count += 1
+            if verbose >= 1:
+                logger.info(" Computing off-diagonal element (%i,%i) [%i/%i]\n" % (i+1, j+1, offdiag_count, total_offdiag))
+
+            if high_accuracy:
+                # 8-point formula
+                E_pp2 = get_energy([(i, 2*h), (j, 2*h)])
+                E_pp1 = get_energy([(i, h), (j, h)])
+                E_pm2 = get_energy([(i, 2*h), (j, -2*h)])
+                E_pm1 = get_energy([(i, h), (j, -h)])
+                E_mp2 = get_energy([(i, -2*h), (j, 2*h)])
+                E_mp1 = get_energy([(i, -h), (j, h)])
+                E_mm2 = get_energy([(i, -2*h), (j, -2*h)])
+                E_mm1 = get_energy([(i, -h), (j, -h)])
+
+                Hx[i, j] = inv_48h2 * (
+                    -E_pp2 + 16*E_pp1
+                    + E_pm2 - 16*E_pm1
+                    + E_mp2 - 16*E_mp1
+                    - E_mm2 + 16*E_mm1
+                )
+            else:
+                # 4-point formula: H[i,j] = (E(+h,+h) - E(+h,-h) - E(-h,+h) + E(-h,-h)) / (4*h^2)
+                E_pp = get_energy([(i, h), (j, h)])
+                E_pm = get_energy([(i, h), (j, -h)])
+                E_mp = get_energy([(i, -h), (j, h)])
+                E_mm = get_energy([(i, -h), (j, -h)])
+
+                Hx[i, j] = inv_4h2 * (E_pp - E_pm - E_mp + E_mm)
+
+            # Symmetrize
+            Hx[j, i] = Hx[i, j]
+
+    logger.info("%i / %i energy calculations complete\n" % (eval_count[0], n_energies))
+
+    # Save Hessian to text file
+    molecule.xyzs[0] = coords.reshape(-1, 3)*bohr2ang
+    molecule[0].write(hessxyz)
+    molecule.xyzs[0] = oldxyz
+    np.savetxt(hesstxt, Hx)
+
+    # Delete displacement calcs because they take up too much space
+    keep_displace = False
+    if not keep_displace:
+        if os.path.exists(os.path.join(dirname, "hessian", "displace")):
+            shutil.rmtree(os.path.join(dirname, "hessian", "displace"))
+
+    return Hx
+
 def frequency_analysis(coords, Hessian, elem=None, mass=None, energy=0.0, temperature=300.0, pressure=1.0, verbose=0, outfnm=None, note=None, wigner=None, ignore=0, normalized=True):
     """
     Parameters

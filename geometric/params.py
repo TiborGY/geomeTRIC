@@ -144,6 +144,13 @@ class OptParams(object):
         # Ignore N lowest force constants when computing free energy
         # (may be used when comparing two free energies when some of the modes are imaginary)
         self.ignore_modes = kwargs.get('ignore_modes', 0)
+        # Whether to compute Hessian from energy-only calculations using finite difference
+        # This is useful for QM methods that do not have analytic gradients
+        self.numerical_hessian = kwargs.get('numerical_hessian', False)
+        # Whether to use high-accuracy (4th order) finite difference formulas for numerical Hessian
+        self.numerical_hessian_high_accuracy = kwargs.get('numerical_hessian_high_accuracy', False)
+        # Displacement step size (in Bohr) for numerical Hessian from energies
+        self.numerical_hessian_displacement = kwargs.get('numerical_hessian_displacement', 1.0e-3)
         # Reset Hessian to guess whenever eigenvalues drop below epsilon
         self.reset = kwargs.get('reset', None)
         if self.reset is None: self.reset = not (self.transition or self.meci or self.hessian == 'each')
@@ -369,6 +376,15 @@ def parse_optimizer_args(*args):
                              'Provide negative number to overwrite any existing samples.\n ')
     grp_hessian.add_argument('--ignore_modes', type=int, help='Number of modes to ignore when computing harmonic free energy (default 0).\n'
                              'The lowest/most negative force constants are ignored first.\n ')
+    grp_hessian.add_argument('--numerical_hessian', type=str2bool, help='Compute Hessian from energy-only calculations using finite difference.\n'
+                             'This is useful for QM methods that do not have analytic gradients (e.g. some coupled cluster methods).\n'
+                             'When enabled, Hessian is computed from energies instead of gradients. Default is "no".\n ')
+    grp_hessian.add_argument('--numerical_hessian_high_accuracy', type=str2bool, help='Use high-accuracy (4th order) finite difference formulas\n'
+                             'for numerical Hessian from energies. Requires more energy evaluations but is more accurate.\n'
+                             'Standard: 3 points diagonal, 4 points off-diagonal.\n'
+                             'High accuracy: 5 points diagonal, 8 points off-diagonal. Default is "no".\n ')
+    grp_hessian.add_argument('--numerical_hessian_displacement', type=float, help='Displacement step size (in Bohr) for numerical Hessian from energies.\n'
+                             'Default is 0.001 Bohr (about 0.0005 Angstrom).\n ')
 
     grp_optparam = parser.add_argument_group('optparam', 'Control various aspects of the optimization algorithm')
     grp_optparam.add_argument('--maxiter', type=int, help='Maximum number of optimization steps, default 300.\n ')

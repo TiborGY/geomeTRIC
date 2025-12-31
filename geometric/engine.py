@@ -1728,6 +1728,8 @@ class Molpro(Engine): # pragma: no cover
 
     def load_molpro_input(self, molproin):
         """ Molpro input file parser, only support xyz coordinates for now """
+        # Store input file path for later use (e.g., loading energy-only template)
+        self.molpro_input_file = molproin
         coords = []
         elems = []
         labels = []
@@ -1880,6 +1882,130 @@ class Molpro(Engine): # pragma: no cover
             raise RuntimeError("Molpro gradient is not found in %s, please check." % molpro_out)
         gradient = np.array(gradient, dtype=np.float64).ravel()
         return {'energy':energy, 'gradient':gradient}
+
+    def load_molpro_input_energy_only(self, molproin):
+        """
+        Molpro input file parser for energy-only calculations (no gradient).
+        Creates a template without the force command for numerical Hessian calculations.
+        """
+        coords = []
+        elems = []
+        labels = []
+        found_molecule, found_geo = False, False
+        molpro_temp_energy = []  # store a template without force command
+        for line in open(molproin):
+            # Skip force command for energy-only calculations
+            if "force" in line.lower():
+                continue
+            if 'geometry' in line:
+                found_molecule = True
+                molpro_temp_energy.append(line)
+            elif found_molecule is True:
+                ls = line.split()
+                if len(ls) == 4:
+                    if found_geo == False:
+                        found_geo = True
+                        molpro_temp_energy.append("$!geometry@here")
+                    # parse the xyz format
+                    elem = re.search('[A-Z][a-z]*',ls[0]).group(0)
+                    elems.append(elem)
+                    labels.append(ls[0].split(elem)[-1])
+                    coords.append(ls[1:4])
+                else:
+                    molpro_temp_energy.append(line)
+                    if '}' in line:
+                        found_molecule = False
+            else:
+                molpro_temp_energy.append(line)
+        self.molpro_temp_energy = molpro_temp_energy
+        # Store elements if not already set
+        if not hasattr(self, 'M') or self.M is None:
+            self.M = Molecule()
+            self.M.elem = elems
+            self.M.xyzs = [np.array(coords, dtype=np.float64)]
+            self.labels = labels
+
+    def calc_energy_only(self, coords, dirname):
+        """
+        Calculate energy only (no gradient) at given coordinates.
+        Used for numerical Hessian calculations when analytic gradients are not available.
+        """
+        # Lazily load the energy-only template if not already loaded
+        if not hasattr(self, 'molpro_temp_energy'):
+            if hasattr(self, 'molpro_input_file'):
+                self.load_molpro_input_energy_only(self.molpro_input_file)
+            else:
+                raise RuntimeError("Molpro input file not available for loading energy-only template. "
+                                   "Please ensure load_molpro_input was called first.")
+        if not os.path.exists(dirname): os.makedirs(dirname)
+        # Convert coordinates back to the xyz file
+        self.M.xyzs[0] = coords.reshape(-1, 3) * bohr2ang
+        # Write Molpro run.mol (energy only, no force)
+        with open(os.path.join(dirname, 'run.mol'), 'w') as outfile:
+            for line in self.molpro_temp_energy:
+                if line == '$!geometry@here':
+                    for e, lab, c in zip(self.M.elem, self.labels, self.M.xyzs[0]):
+                        outfile.write("%s%-7s %16.10f %16.10f %16.10f\n" % (e, lab, c[0], c[1], c[2]))
+                else:
+                    outfile.write(line)
+        try:
+            # Run Molpro
+            subprocess.check_call('%s%s run.mol' % (self.molproExe(), self.nt()), cwd=dirname, shell=True)
+            # Read energy only from Molpro output
+            result = self.read_energy_only(dirname)
+        except (OSError, IOError, RuntimeError, subprocess.CalledProcessError):
+            raise MolproEngineError
+        return result
+
+    def read_energy_only(self, dirname):
+        """ Read energy only from Molpro output (XML preferred for higher precision) """
+        molpro_xml = os.path.join(dirname, 'run.xml')
+        if os.path.exists(molpro_xml):
+            try:
+                return self.read_energy_only_xml(molpro_xml)
+            except Exception as e:
+                logger.warning("Failed to parse Molpro XML output (%s), falling back to text output" % str(e))
+        return self.read_energy_only_text(dirname)
+
+    def read_energy_only_xml(self, molpro_xml):
+        """ Read energy from Molpro XML output file (higher precision) """
+        namespaces = {
+            'molpro': 'http://www.molpro.net/schema/molpro-output',
+            'cml': 'http://www.xml-cml.org/schema',
+            'stm': 'http://www.xml-cml.org/schema',
+            'xhtml': 'http://www.w3.org/1999/xhtml'
+        }
+        tree = ET.parse(molpro_xml)
+        root = tree.getroot()
+        energy = None
+        # Find all jobstep elements
+        for jobstep in root.iter('{http://www.molpro.net/schema/molpro-output}jobstep'):
+            # Look for energy with principal="true" attribute (the main result)
+            for prop in jobstep.findall('molpro:property', namespaces):
+                if prop.get('principal') == 'true' and prop.get('name') in ['Energy', 'total energy']:
+                    energy = float(prop.get('value'))
+        if energy is None:
+            raise RuntimeError("Molpro energy is not found in %s, please check." % molpro_xml)
+        return {'energy': energy}
+
+    def read_energy_only_text(self, dirname):
+        """ Read energy from Molpro text output file """
+        energy = None
+        molpro_out = os.path.join(dirname, 'run.out')
+        with open(molpro_out) as outfile:
+            for line in outfile:
+                line_strip = line.strip()
+                fields = line_strip.split()
+                if line_strip.startswith('!'):
+                    # This works for RHF and RKS
+                    if len(fields) == 5 and fields[-2] == 'Energy':
+                        energy = float(fields[-1])
+                    # This works for MP2, CCSD and CCSD(T) total energy
+                    elif len(fields) == 4 and fields[1] == 'total' and fields[2] == 'energy:':
+                        energy = float(fields[-1])
+        if energy is None:
+            raise RuntimeError("Molpro energy is not found in %s, please check." % molpro_out)
+        return {'energy': energy}
 
     def detect_dft(self):
         for line in self.molpro_temp:
